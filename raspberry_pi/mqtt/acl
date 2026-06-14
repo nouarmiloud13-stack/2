@@ -1,0 +1,14 @@
+# /mosquitto/config/acl — Contrôle d'accès MQTT par topic
+# Format : user <username> / topic [read|write|readwrite] <topic>
+#
+# Rôles :
+#   gnl_publisher  → publie les données capteurs (Raspberry Pi / simulateur)
+#   gnl_dashboard  → lit toutes les données (Dashboard HTML + Grafana + healthcheck)
+#   gnl_admin      → lecture + écriture + commandes (opérateur autorisé)
+#
+# Fix : gnl_dashboard manquait la permission `$SYS/#` → healthcheck timeout
+
+# ── nouar (utilisateur unique — accès complet) ────────────────────────────────
+user nouar
+topic readwrite $SYS/#
+topic readwrite gnl/#
