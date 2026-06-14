@@ -4,6 +4,7 @@
 #         ou manuellement → docker compose -f docker/docker-compose.yml up -d
 #
 # ⚠️  MQTT plain (port 1883) — réseau Docker interne uniquement.
+#     MQTT TLS  (port 8883) — connexions externes chiffrées.
 #     ngrok expose uniquement l'API REST + Dashboard (port 5000) via HTTPS.
 #
 # ARCHITECTURE NGROK :
@@ -40,10 +41,12 @@ services:
 
     ports:
       - "1883:1883"
+      - "8883:8883"    # ← port TLS externe
 
     volumes:
       - ../raspberry_pi/mqtt/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - ../raspberry_pi/mqtt/acl:/mosquitto/config/acl:ro
+      - ../docker/certs:/mosquitto/certs:ro    # ← certificats TLS
       - mosquitto_data:/mosquitto/data
       - mosquitto_log:/mosquitto/log
 
@@ -71,7 +74,7 @@ services:
       retries: 3
       start_period: 15s
 
-  # ── MongoDB — Historique GNL (lectures, diagnostics IA, évènements) ─────────
+  # ── MongoDB — Historique GNL ─────────────────────────────────────────────────
   mongodb:
     image: mongo:7.0
     container_name: gnl_mongodb
@@ -80,7 +83,7 @@ services:
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASS}
       MONGO_INITDB_DATABASE:      gnl_history
     ports:
-      - "27017:27017"    # exposé sur l'hôte pour accès depuis Flask local (Codespaces)
+      - "27017:27017"
     volumes:
       - mongodb_data:/data/db
     networks:
@@ -94,12 +97,6 @@ services:
       start_period: 20s
 
   # ── Mongo-Express — Interface web MongoDB ────────────────────────────────────
-  #
-  #  Accès local : http://localhost:8081
-  #  Login       : nouar / hamel
-  #
-  #  ⚠️  Exposé uniquement sur l'hôte (pas via ngrok) — données internes
-  # ─────────────────────────────────────────────────────────────────────────────
   mongo_express:
     image: mongo-express:1.0.2
     container_name: gnl_mongo_express
@@ -128,7 +125,7 @@ services:
     image: gnl_edge_node
     container_name: gnl_edge_node
     ports:
-      - "5000:5000"   # exposé sur l'hôte pour que ngrok puisse le tunneler
+      - "5000:5000"
     environment:
       MQTT_HOST:           mosquitto
       MQTT_PORT:           "1883"
@@ -138,9 +135,7 @@ services:
       JWT_EXPIRY_S:        "3600"
       API_TIMEOUT_S:       "3600"
       SERIAL_PORT:         SIMULATED
-      # URL publique ngrok transmise à Flask pour les redirections CORS
       PUBLIC_URL:          https://theology-custody-rocky.ngrok-free.dev
-      # Smart AI (Gemma4 ou Claude)
       GNL_AI_PROVIDER:     ${GNL_AI_PROVIDER:-gemma4}
       GEMMA4_HOST:         gemma4
       GEMMA4_SERVER_PORT:  "8080"
@@ -150,18 +145,15 @@ services:
       GNL_AI_INTERVAL:     ${GNL_AI_INTERVAL:-30}
       GNL_AI_RISK_TRIGGER: ${GNL_AI_RISK_TRIGGER:-60}
       GNL_AI_MAX_TOKENS:   ${GNL_AI_MAX_TOKENS:-512}
-      # MongoDB historique
       MONGO_URI:  mongodb://${MONGO_USER}:${MONGO_PASS}@mongodb:27017/
       MONGO_DB:   gnl_history
       MONGO_TTL_DAYS: ${MONGO_TTL_DAYS:-30}
-      # Watchdog sécurité
       WATCHDOG_TIMEOUT_S:       ${WATCHDOG_TIMEOUT_S:-30}
       WATCHDOG_MAX_ERRORS:      ${WATCHDOG_MAX_ERRORS:-10}
       WATCHDOG_TICK_S:          ${WATCHDOG_TICK_S:-2.0}
       WATCHDOG_OS_SHUTDOWN:     ${WATCHDOG_OS_SHUTDOWN:-false}
       WATCHDOG_SENSORS_DEAD_MAX: ${WATCHDOG_SENSORS_DEAD_MAX:-5}
       ESD_ACK_TIMEOUT_S:        ${ESD_ACK_TIMEOUT_S:-10}
-      # Seuils IA
       GAS_WARN:     ${GAS_WARN:-250}
       GAS_DANGER:   ${GAS_DANGER:-450}
       LEVEL_HIGH:   ${LEVEL_HIGH:-95}
@@ -185,11 +177,7 @@ services:
       retries: 3
       start_period: 15s
 
-  # ── Gemma4 E2B — Serveur llama.cpp (Edge AI local, hors-ligne) ──────────────
-  #
-  # Prérequis : make download-gemma4  (télécharge ~3.5 GB)
-  # Mémoire requise : ~5 GB RAM (RPi4 8GB recommandé)
-  # ─────────────────────────────────────────────────────────────────────────────
+  # ── Gemma4 E2B — Serveur llama.cpp ──────────────────────────────────────────
   gemma4:
     image: ghcr.io/ggml-org/llama.cpp:server
     container_name: gnl_gemma4
@@ -224,19 +212,9 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 90s   # chargement modèle ~60s sur RPi4
+      start_period: 90s
 
-  # ── ngrok — Tunnel HTTPS vers l'API REST (port 5000) ─────────────────────────
-  #
-  # ngrok expose gnl_edge:5000 sur https://theology-custody-rocky.ngrok-free.dev
-  #
-  # Prérequis :
-  #   1. Avoir un compte ngrok (ngrok.com)
-  #   2. Réserver le domaine statique dans le dashboard ngrok
-  #   3. Renseigner NGROK_AUTHTOKEN dans le fichier .env
-  #
-  # ngrok dashboard local : http://localhost:4040
-  # ─────────────────────────────────────────────────────────────────────────────
+  # ── ngrok — Tunnel HTTPS ─────────────────────────────────────────────────────
   ngrok:
     image: ngrok/ngrok:latest
     container_name: gnl_ngrok
@@ -249,7 +227,7 @@ services:
     environment:
       NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
     ports:
-      - "4040:4040"    # dashboard web ngrok (inspecter les tunnels)
+      - "4040:4040"
     networks:
       - gnl_net
     depends_on:
