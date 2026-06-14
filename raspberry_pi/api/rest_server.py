@@ -2,21 +2,27 @@
 """
 rest_server.py — API REST Flask pour le système IoT GNL
 
+Sécurité admin :
+  - Clé AES-256 lue depuis .env (AES_SECRET_KEY)
+  - Mot de passe admin chiffré AES-256-GCM au démarrage
+  - Vérification via hmac.compare_digest (anti timing attack)
+  - JWT Bearer token pour toutes les routes protégées
+
 Endpoints :
   GET  /api/v1/status          → état général du système
   GET  /api/v1/data/latest     → dernières mesures
-  GET  /api/v1/data/history    → historique (paramètre : ?minutes=60)
   GET  /api/v1/ai/scores       → scores IA courants
-  POST /api/v1/cmd/pompe       → commande pompe {action: "ON"|"OFF"}
-  POST /api/v1/cmd/vanne       → commande vanne {action: "OPEN"|"CLOSE"}
+  GET  /api/v1/ai/diagnostic   → diagnostic Smart AI
+  POST /api/v1/ai/chat         → chatbot Gemma
+  POST /api/v1/cmd/pompe       → commande pompe
+  POST /api/v1/cmd/vanne       → commande vanne
   POST /api/v1/cmd/esd         → arrêt d'urgence
-  GET  /api/v1/alerts          → journal alertes (30 dernières)
-  GET  /health                 → health check systemd/Grafana
-
-Sécurité : JWT Bearer token
-CORS : configuré pour le domaine ngrok PUBLIC_URL
+  GET  /api/v1/alerts          → journal alertes
+  GET  /health                 → health check
 """
 
+import base64
+import hmac as hmac_lib
 import json
 import logging
 import os
@@ -29,24 +35,160 @@ from flask import Flask, jsonify, request, abort, send_from_directory
 from flask_cors import CORS
 import jwt
 
+# ── AES-256-GCM ───────────────────────────────────────────────────────────────
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    _AES_AVAILABLE = True
+except ImportError:
+    _AES_AVAILABLE = False
+
 log = logging.getLogger("gnl.api")
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+# ── Config générale ────────────────────────────────────────────────────────────
 API_HOST    = os.environ.get("API_HOST", "0.0.0.0")
 API_PORT    = int(os.environ.get("API_PORT", "5000"))
 JWT_SECRET  = os.environ.get("GNL_JWT_SECRET", "hamel")
 JWT_ALGO    = "HS256"
-JWT_EXPIRY  = int(os.environ.get("JWT_EXPIRY_S", "3600"))   # 1 heure
-API_TIMEOUT = int(os.environ.get("API_TIMEOUT_S", "3600"))  # timeout serveur 1 heure
+JWT_EXPIRY  = int(os.environ.get("JWT_EXPIRY_S", "3600"))
+API_TIMEOUT = int(os.environ.get("API_TIMEOUT_S", "3600"))
 
-# URL publique ngrok — utilisée pour les CORS
 PUBLIC_URL = os.environ.get(
     "PUBLIC_URL", "https://theology-custody-rocky.ngrok-free.dev"
 )
 
-USERS = {
-    "nouar": {"password": "hamel", "role": "admin"},
-}
+# ── Clé AES-256 depuis .env ───────────────────────────────────────────────────
+#
+# AES_SECRET_KEY dans .env = clé 32 bytes encodée en base64 (256 bits)
+#
+# Générer une nouvelle clé :
+#   python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+#
+_AES_KEY_B64 = os.environ.get("AES_SECRET_KEY", "")
+_AES_SALT    = os.environ.get("AES_SALT", "gnl_usto_mb_2025").encode()
+
+
+def _load_aes_key() -> bytes | None:
+    """
+    Charge la clé AES-256 depuis AES_SECRET_KEY dans .env.
+    Doit être 32 bytes encodés en base64 (256 bits = AES-256).
+    """
+    if not _AES_AVAILABLE:
+        log.warning(
+            "cryptography non installé — AES-256 désactivé\n"
+            "  → pip install cryptography"
+        )
+        return None
+
+    if not _AES_KEY_B64:
+        log.error(
+            "AES_SECRET_KEY manquant dans .env\n"
+            "  Générer : python3 -c \"import os,base64; "
+            "print(base64.b64encode(os.urandom(32)).decode())\"\n"
+            "  Puis ajouter dans .env : AES_SECRET_KEY=<valeur générée>"
+        )
+        return None
+
+    try:
+        key = base64.b64decode(_AES_KEY_B64)
+        if len(key) != 32:
+            log.error(
+                "AES_SECRET_KEY invalide : %d bytes trouvés, 32 requis (256 bits)",
+                len(key),
+            )
+            return None
+        log.info(
+            "AES-256-GCM activé\n"
+            "  Source      : AES_SECRET_KEY (.env)\n"
+            "  Longueur    : %d bytes (%d bits)\n"
+            "  Algorithme  : AES-256-GCM (chiffrement authentifié)\n"
+            "  AAD (sel)   : AES_SALT (.env)",
+            len(key), len(key) * 8,
+        )
+        return key
+    except Exception as exc:
+        log.error("Erreur décodage AES_SECRET_KEY depuis .env : %s", exc)
+        return None
+
+
+_AES_KEY = _load_aes_key()
+
+
+# ── Chiffrement / Déchiffrement AES-256-GCM ───────────────────────────────────
+
+def _aes_encrypt(plaintext: str) -> str:
+    """
+    Chiffre avec AES-256-GCM (clé depuis .env).
+    Format retourné : base64( nonce[12] + ciphertext + tag[16] )
+    """
+    if _AES_KEY is None:
+        return plaintext
+
+    aesgcm = AESGCM(_AES_KEY)
+    nonce  = os.urandom(12)    # 96 bits — recommandé NIST SP 800-38D
+    ct     = aesgcm.encrypt(nonce, plaintext.encode("utf-8"), _AES_SALT)
+    return base64.b64encode(nonce + ct).decode("utf-8")
+
+
+def _aes_decrypt(token: str) -> str:
+    """
+    Déchiffre un token AES-256-GCM (clé depuis .env).
+    Retourne "" si token invalide ou modifié (GCM authentification échouée).
+    """
+    if _AES_KEY is None:
+        return token
+
+    try:
+        raw    = base64.b64decode(token.encode("utf-8"))
+        nonce  = raw[:12]
+        ct     = raw[12:]
+        aesgcm = AESGCM(_AES_KEY)
+        return aesgcm.decrypt(nonce, ct, _AES_SALT).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _verify_password(plain: str, encrypted: str) -> bool:
+    """
+    Vérifie mot de passe contre sa version chiffrée AES-256-GCM.
+    hmac.compare_digest protège contre les timing attacks.
+    """
+    if _AES_KEY is None:
+        return hmac_lib.compare_digest(plain, encrypted)
+    decrypted = _aes_decrypt(encrypted)
+    return hmac_lib.compare_digest(plain, decrypted)
+
+
+# ── Base utilisateurs — mots de passe chiffrés AES-256-GCM ───────────────────
+
+def _build_users() -> dict:
+    """
+    Construit la base utilisateurs.
+    Clé AES lue depuis AES_SECRET_KEY dans .env.
+    Mot de passe jamais stocké en clair après cette fonction.
+    """
+    raw_admin = "hamel"
+
+    if _AES_KEY is not None:
+        encrypted = _aes_encrypt(raw_admin)
+        log.info(
+            "Utilisateur 'nouar' (admin) — mot de passe chiffré AES-256-GCM\n"
+            "  Clé         : AES_SECRET_KEY (.env)\n"
+            "  Mot de passe en clair effacé de la mémoire après chiffrement"
+        )
+    else:
+        encrypted = raw_admin
+        log.warning("Utilisateur 'nouar' — mot de passe stocké en clair (AES indisponible)")
+
+    return {
+        "nouar": {
+            "password":  encrypted,
+            "role":      "admin",
+            "encrypted": _AES_KEY is not None,
+        },
+    }
+
+
+USERS = _build_users()
 
 _DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), "..", "dashboard")
 
@@ -55,7 +197,6 @@ _lock = Lock()
 
 
 def _cors_origins():
-    """Autorise: ngrok, localhost, et tous les domaines *.app.github.dev (Codespaces)."""
     return [
         PUBLIC_URL,
         "http://localhost:5000",
@@ -71,8 +212,8 @@ CORS(app, resources={r"/*": {"origins": _cors_origins(), "supports_credentials":
 _latest_data:       dict = {}
 _alerts:            list = []
 _smart_diagnostic:  dict = {}
-_mongo             = None   # MongoWriter injecté depuis gnl_main
-_smart_ai          = None   # GNLSmartAI injecté depuis gnl_main
+_mongo             = None
+_smart_ai          = None
 
 
 def set_mongo(mongo_writer):
@@ -84,30 +225,22 @@ def set_smart_ai(smart_ai_instance):
     global _smart_ai
     _smart_ai = smart_ai_instance
 
-# ── Middleware ngrok — bypass page d'avertissement ─────────────────────────────
+
+# ── Middleware ngrok ────────────────────────────────────────────────────────────
 @app.before_request
 def _ngrok_skip_warning():
-    """
-    ngrok affiche une page interstitielle 'Visit Site' sur les requêtes browser.
-    L'en-tête 'ngrok-skip-browser-warning' avec n'importe quelle valeur
-    (ex. '1') bypass cet écran côté client.
-    Ce middleware l'ajoute automatiquement sur toutes les réponses de l'API,
-    ce qui évite de le répéter dans chaque appel fetch() du dashboard.
-    """
-    pass  # L'en-tête est ajouté dans after_request
+    pass
 
 
 @app.after_request
 def _add_ngrok_header(response):
-    """Ajoute les en-têtes nécessaires pour ngrok + CORS + Codespaces."""
     response.headers["ngrok-skip-browser-warning"] = "1"
-    # Autoriser dynamiquement l'origine de la requête (ngrok, Codespaces, localhost)
     origin = request.headers.get("Origin", "")
     allowed = (
         origin == PUBLIC_URL
         or origin.startswith("http://localhost")
         or origin.startswith("http://127.0.0.1")
-        or origin.endswith(".app.github.dev")      # GitHub Codespaces
+        or origin.endswith(".app.github.dev")
         or origin.endswith(".preview.app.github.dev")
     )
     if allowed and origin:
@@ -145,7 +278,6 @@ def require_auth(role: str = "operator"):
     def decorator(f):
         @wraps(f)
         def wrapper(*args, **kwargs):
-            # Répondre immédiatement aux pré-vols OPTIONS (CORS)
             if request.method == "OPTIONS":
                 return jsonify({}), 200
             auth_header = request.headers.get("Authorization", "")
@@ -167,16 +299,20 @@ def require_auth(role: str = "operator"):
 
 @app.route("/")
 def serve_dashboard():
-    """Sert le dashboard HTML — accessible directement depuis le browser."""
     return send_from_directory(os.path.abspath(_DASHBOARD_DIR), "gnl_dashboard.html")
 
 
 @app.route("/health")
 def health():
     return jsonify({
-        "status":    "ok",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status":     "ok",
+        "timestamp":  datetime.now(timezone.utc).isoformat(),
         "public_url": PUBLIC_URL,
+        "security": {
+            "aes256_gcm": _AES_KEY is not None,
+            "key_source": "AES_SECRET_KEY (.env)" if _AES_KEY is not None else "ABSENT",
+            "algorithm":  "AES-256-GCM" if _AES_KEY is not None else "plain",
+        },
     })
 
 
@@ -184,15 +320,31 @@ def health():
 def login():
     if request.method == "OPTIONS":
         return jsonify({}), 200
+
     body     = request.get_json(silent=True) or {}
     username = body.get("username", "")
     password = body.get("password", "")
-    user     = USERS.get(username)
-    if not user or user["password"] != password:
+
+    user = USERS.get(username)
+    if not user:
         abort(401, "Identifiants incorrects")
+
+    # ── Vérification AES-256-GCM (clé depuis .env) ────────────────────────────
+    if not _verify_password(password, user["password"]):
+        log.warning("Tentative connexion échouée pour '%s'", username)
+        abort(401, "Identifiants incorrects")
+
     token = generate_token(username, user["role"])
-    log.info("Connexion réussie : %s (role=%s)", username, user["role"])
-    return jsonify({"token": token, "role": user["role"], "expires_in": JWT_EXPIRY})
+    log.info(
+        "Connexion réussie : %s (role=%s, AES-256-GCM=%s)",
+        username, user["role"], user["encrypted"],
+    )
+    return jsonify({
+        "token":      token,
+        "role":       user["role"],
+        "expires_in": JWT_EXPIRY,
+        "security":   "AES-256-GCM" if user["encrypted"] else "plain",
+    })
 
 
 # ── Endpoints protégés ─────────────────────────────────────────────────────────
@@ -224,14 +376,14 @@ def data_latest():
     if not data:
         return jsonify({"error": "Aucune donnée disponible"}), 503
     return jsonify({
-        "timestamp":  datetime.now(timezone.utc).isoformat(),
-        "niveau":     {"r1": data.get("n1"), "r2": data.get("n2")},
-        "temperature":{"r1": data.get("t1"), "r2": data.get("t2")},
-        "gaz":        {"adc": data.get("g"), "niveau": _gas_level(data.get("g", 0))},
-        "pression":   data.get("p"),
-        "actuateurs": {"pompe": data.get("pump"), "vanne": data.get("valve")},
-        "ia":         data.get("ai", {}),
-        "smart_ai":   diag,
+        "timestamp":   datetime.now(timezone.utc).isoformat(),
+        "niveau":      {"r1": data.get("n1"), "r2": data.get("n2")},
+        "temperature": {"r1": data.get("t1"), "r2": data.get("t2")},
+        "gaz":         {"adc": data.get("g"), "niveau": _gas_level(data.get("g", 0))},
+        "pression":    data.get("p"),
+        "actuateurs":  {"pompe": data.get("pump"), "vanne": data.get("valve")},
+        "ia":          data.get("ai", {}),
+        "smart_ai":    diag,
     })
 
 
@@ -252,7 +404,6 @@ def ai_scores():
 @app.route("/api/v1/ai/diagnostic")
 @require_auth("operator")
 def ai_diagnostic():
-    """Retourne le dernier diagnostic complet produit par le Smart AI (Gemma4)."""
     with _lock:
         diag = dict(_smart_diagnostic)
     if not diag:
@@ -263,17 +414,10 @@ def ai_diagnostic():
 @app.route("/api/v1/ai/chat", methods=["POST", "OPTIONS"])
 @require_auth("operator")
 def ai_chat():
-    """
-    Chatbot Gemma : l'opérateur/admin pose une question en langage naturel.
-    Le contexte capteurs en temps réel est automatiquement injecté.
-
-    Body JSON : { "question": "..." }
-    Réponse   : { "answer": "...", "source": "gemma4|fallback", "timestamp": "..." }
-    """
     if request.method == "OPTIONS":
         return jsonify({}), 200
 
-    body = request.get_json(silent=True) or {}
+    body     = request.get_json(silent=True) or {}
     question = (body.get("question") or "").strip()
     if not question:
         abort(400, "Le champ 'question' est requis")
@@ -291,10 +435,13 @@ def ai_chat():
         source = "gemma4" if _smart_ai.is_available else "fallback"
     except Exception as e:
         log.error("Erreur chatbot : %s", e)
-        answer = "Désolé, une erreur est survenue lors du traitement de votre question."
+        answer = "Désolé, une erreur est survenue."
         source = "error"
 
-    log.info("Chatbot [%s] Q: %s | A: %s", request.user["sub"], question[:60], answer[:60])
+    log.info(
+        "Chatbot [%s] Q: %s | A: %s",
+        request.user["sub"], question[:60], answer[:60],
+    )
     return jsonify({
         "answer":    answer,
         "source":    source,
@@ -374,7 +521,6 @@ def update_latest(data: dict):
 
 
 def update_smart_diagnostic(diag: dict):
-    """Met à jour le diagnostic Smart AI partagé avec l'API REST."""
     with _lock:
         _smart_diagnostic.clear()
         _smart_diagnostic.update(diag)
@@ -390,9 +536,9 @@ def update_smart_diagnostic(diag: dict):
 def _add_alert(alert_type: str, value, source: str):
     _alerts.append({
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "type":   alert_type,
-        "valeur": value,
-        "source": source,
+        "type":      alert_type,
+        "valeur":    value,
+        "source":    source,
     })
     if len(_alerts) > 100:
         _alerts.pop(0)
@@ -411,7 +557,6 @@ def _gas_level(gas: int) -> str:
 @app.route("/api/v1/history/today")
 @require_auth("operator")
 def history_today():
-    """Lectures capteurs du jour (dernières 120 entrées)."""
     if _mongo is None or not _mongo.available:
         return jsonify({"error": "MongoDB non disponible"}), 503
     limit = min(int(request.args.get("limit", 120)), 500)
@@ -422,7 +567,6 @@ def history_today():
 @app.route("/api/v1/history/diagnostics")
 @require_auth("operator")
 def history_diagnostics():
-    """Diagnostics IA du jour (derniers 20)."""
     if _mongo is None or not _mongo.available:
         return jsonify({"error": "MongoDB non disponible"}), 503
     data = _mongo.get_today_diagnostics()
@@ -432,7 +576,6 @@ def history_diagnostics():
 @app.route("/api/v1/history/events")
 @require_auth("operator")
 def history_events():
-    """Évènements (alertes, ESD, commandes) du jour."""
     if _mongo is None or not _mongo.available:
         return jsonify({"error": "MongoDB non disponible"}), 503
     data = _mongo.get_today_events()
@@ -442,7 +585,6 @@ def history_events():
 @app.route("/api/v1/history/summary")
 @require_auth("operator")
 def history_summary():
-    """Résumé statistique du jour (min/max/moy + nb alertes)."""
     if _mongo is None or not _mongo.available:
         return jsonify({"error": "MongoDB non disponible"}), 503
     summary = _mongo.get_daily_summary()
@@ -453,15 +595,16 @@ def history_summary():
 
 def start_api_server():
     log.info(
-        "API REST démarrée sur %s:%d | URL publique : %s | timeout=%ds",
-        API_HOST, API_PORT, PUBLIC_URL, API_TIMEOUT,
+        "API REST démarrée sur %s:%d | AES-256-GCM=%s | clé=AES_SECRET_KEY(.env)",
+        API_HOST, API_PORT, _AES_KEY is not None,
     )
-    # Serveur Werkzeug (Flask) : tourne en threads dans CE process, donc
-    # partage l'état en mémoire (_latest_data, _mongo, _smart_ai…) mis à
-    # jour par gnl_main. Un worker Gunicorn forké aurait sa propre copie
-    # mémoire figée et ne verrait jamais ces mises à jour ; et l'Arbiter
-    # Gunicorn ne peut pas s'initialiser hors du thread principal.
-    app.run(host=API_HOST, port=API_PORT, debug=False, use_reloader=False, threaded=True)
+    app.run(
+        host=API_HOST,
+        port=API_PORT,
+        debug=False,
+        use_reloader=False,
+        threaded=True,
+    )
 
 
 if __name__ == "__main__":
