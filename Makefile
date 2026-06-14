@@ -11,6 +11,7 @@ SHELL := /bin/bash
 .PHONY: all help start start-codespaces start-rpi start-local stop restart status logs clean \
         fclean install install-python install-system install-docker \
         setup-security setup-influx setup-mqtt up down build rebuild \
+        setup-certs check-certs \
         test test-verbose test-coverage \
         download-gemma4 start-gemma4 stop-gemma4 gemma4-status \
         ngrok ngrok-install ngrok-config ngrok-start ngrok-stop \
@@ -40,6 +41,7 @@ PROJECT_DIR   := $(shell pwd)
 DOCKER_DIR    := $(PROJECT_DIR)/docker
 RPI_DIR       := $(PROJECT_DIR)/raspberry_pi
 TESTS_DIR     := $(PROJECT_DIR)/tests
+CERT_DIR      := $(DOCKER_DIR)/certs
 
 COMPOSE        := docker compose -f $(DOCKER_DIR)/docker-compose.yml
 COMPOSE_AI     := $(COMPOSE) --profile ai
@@ -73,6 +75,75 @@ JWT_TOKEN := $(shell curl -s -X POST $(API_URL)/auth/login \
                2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('token',''))" 2>/dev/null)
 
 # ── ══════════════════════════════════════════════════════════════════════════ ──
+##  CERTIFICATS TLS
+# ── ══════════════════════════════════════════════════════════════════════════ ──
+
+## setup-certs      : Génère les certificats TLS (CA + serveur + client) si absents
+setup-certs:
+	@if [ -f "$(CERT_DIR)/ca.crt" ]; then \
+	  echo -e "$(GREEN)  ✓ Certificats TLS déjà présents dans $(CERT_DIR)$(NC)"; \
+	else \
+	  echo -e "$(GREEN)► Génération des certificats TLS (CA locale GNL)...$(NC)"; \
+	  mkdir -p $(CERT_DIR); \
+	  echo -e "$(GREEN)  1/3 — Autorité de Certification (CA)...$(NC)"; \
+	  openssl genrsa -out $(CERT_DIR)/ca.key 4096 2>/dev/null; \
+	  openssl req -new -x509 -days 3650 \
+	    -key $(CERT_DIR)/ca.key \
+	    -out $(CERT_DIR)/ca.crt \
+	    -subj "/CN=GNL-Edge-CA/O=USTO-MB/C=DZ" 2>/dev/null; \
+	  echo -e "$(GREEN)  2/3 — Certificat serveur Mosquitto...$(NC)"; \
+	  openssl genrsa -out $(CERT_DIR)/server.key 4096 2>/dev/null; \
+	  openssl req -new \
+	    -key $(CERT_DIR)/server.key \
+	    -out $(CERT_DIR)/server.csr \
+	    -subj "/CN=localhost/O=USTO-MB/C=DZ" 2>/dev/null; \
+	  openssl x509 -req \
+	    -in  $(CERT_DIR)/server.csr \
+	    -CA  $(CERT_DIR)/ca.crt \
+	    -CAkey $(CERT_DIR)/ca.key \
+	    -CAcreateserial \
+	    -out $(CERT_DIR)/server.crt \
+	    -days 1825 2>/dev/null; \
+	  echo -e "$(GREEN)  3/3 — Certificat client (publisher)...$(NC)"; \
+	  openssl genrsa -out $(CERT_DIR)/client.key 4096 2>/dev/null; \
+	  openssl req -new \
+	    -key $(CERT_DIR)/client.key \
+	    -out $(CERT_DIR)/client.csr \
+	    -subj "/CN=gnl-publisher/O=USTO-MB/C=DZ" 2>/dev/null; \
+	  openssl x509 -req \
+	    -in  $(CERT_DIR)/client.csr \
+	    -CA  $(CERT_DIR)/ca.crt \
+	    -CAkey $(CERT_DIR)/ca.key \
+	    -CAcreateserial \
+	    -out $(CERT_DIR)/client.crt \
+	    -days 1825 2>/dev/null; \
+	  chmod 600 $(CERT_DIR)/*.key; \
+	  chmod 644 $(CERT_DIR)/*.crt; \
+	  rm -f $(CERT_DIR)/*.csr $(CERT_DIR)/*.srl; \
+	  echo -e "$(GREEN)  ✓ Certificats TLS générés dans $(CERT_DIR)$(NC)"; \
+	  echo -e "$(BLUE)    ca.crt     — Autorité de Certification$(NC)"; \
+	  echo -e "$(BLUE)    server.crt — Mosquitto broker (port 8883)$(NC)"; \
+	  echo -e "$(BLUE)    client.crt — Publisher RPi/Edge$(NC)"; \
+	fi
+
+## check-certs      : Vérifie la validité des certificats TLS
+check-certs:
+	@echo -e "$(BOLD)$(BLUE)══ Certificats TLS ══$(NC)"
+	@if [ ! -f "$(CERT_DIR)/ca.crt" ]; then \
+	  echo -e "$(RED)  ✗ Aucun certificat — make setup-certs$(NC)"; \
+	else \
+	  echo -e "$(GREEN)  ✓ ca.crt$(NC)"; \
+	  openssl verify -CAfile $(CERT_DIR)/ca.crt $(CERT_DIR)/server.crt > /dev/null 2>&1 \
+	    && echo -e "$(GREEN)  ✓ server.crt (valide)$(NC)" \
+	    || echo -e "$(RED)  ✗ server.crt invalide$(NC)"; \
+	  openssl verify -CAfile $(CERT_DIR)/ca.crt $(CERT_DIR)/client.crt > /dev/null 2>&1 \
+	    && echo -e "$(GREEN)  ✓ client.crt (valide)$(NC)" \
+	    || echo -e "$(RED)  ✗ client.crt invalide$(NC)"; \
+	  echo -e "$(BLUE)  Expiration server.crt :$(NC)"; \
+	  openssl x509 -in $(CERT_DIR)/server.crt -noout -enddate 2>/dev/null; \
+	fi
+
+# ── ══════════════════════════════════════════════════════════════════════════ ──
 ##  COMMANDE PRINCIPALE
 # ── ══════════════════════════════════════════════════════════════════════════ ──
 
@@ -85,7 +156,7 @@ start:
 	fi
 
 ## start-codespaces : Codespaces — Arduino bridge PC + MongoDB + InfluxDB (Docker) + Edge Node
-start-codespaces: .env
+start-codespaces: .env setup-certs
 	@echo ""
 	@echo -e "$(BOLD)$(CYAN)╔══════════════════════════════════════════════════════════╗$(NC)"
 	@echo -e "$(BOLD)$(CYAN)║   GNL IoT Edge — GitHub Codespaces (Données Réelles)     ║$(NC)"
@@ -149,6 +220,7 @@ start-codespaces: .env
 	@echo ""
 	@echo -e "$(BOLD)━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$(NC)"
 	@echo -e "$(BOLD)  MQTT broker  :$(NC) broker.hivemq.com:1883 (public)"
+	@echo -e "$(BOLD)  MQTT TLS     :$(NC) localhost:8883 (certificats docker/certs/)"
 	@echo -e "$(BOLD)  IA           :$(NC) Gemma4 local (Docker, localhost:8080)"
 	@echo -e "$(BOLD)  API REST     :$(NC) http://0.0.0.0:5000"
 	@echo -e "$(BOLD)  Dashboard    :$(NC) onglet Ports Codespaces → port 5000"
@@ -189,7 +261,7 @@ start-codespaces: .env
 	 $(PYTHON) $(RPI_DIR)/gnl_main.py
 
 ## start-rpi        : Raspberry Pi physique (Gemma4 + Docker + ngrok)
-start-rpi: check-deps .env
+start-rpi: check-deps .env setup-certs
 	@echo -e "$(BOLD)$(CYAN)╔══════════════════════════════════════════════════════════╗$(NC)"
 	@echo -e "$(BOLD)$(CYAN)║   GNL IoT Edge — Raspberry Pi (Gemma4 + ngrok)           ║$(NC)"
 	@echo -e "$(BOLD)$(CYAN)╚══════════════════════════════════════════════════════════╝$(NC)"
@@ -214,7 +286,7 @@ start-rpi: check-deps .env
 	@echo -e "  Dashboard → $(NGROK_URL)"
 
 ## start-local      : Mode local sans ngrok (test rapide)
-start-local: check-deps .env
+start-local: check-deps .env setup-certs
 	@echo -e "$(BOLD)$(CYAN)╔══════════════════════════════════════════╗$(NC)"
 	@echo -e "$(BOLD)$(CYAN)║  GNL IoT Edge — Mode LOCAL               ║$(NC)"
 	@echo -e "$(BOLD)$(CYAN)╚══════════════════════════════════════════╝$(NC)"
@@ -229,6 +301,7 @@ start-local: check-deps .env
 	@echo -e "  Grafana      → http://localhost:3000"
 	@echo -e "  InfluxDB     → http://localhost:8086"
 	@echo -e "  MongoDB UI   → http://localhost:8081  (nouar / hamel)"
+	@echo -e "  MQTT TLS     → localhost:8883 (certificats dans docker/certs/)"
 
 # ── ══════════════════════════════════════════════════════════════════════════ ──
 ##  CONTRÔLE DU SYSTÈME
@@ -264,7 +337,7 @@ rebuild:
 	@$(COMPOSE) build --no-cache --pull
 	@$(COMPOSE) --profile ai up -d
 
-## status           : État de tous les services (API, Gemma4, InfluxDB, MongoDB, Grafana)
+## status           : État de tous les services
 status:
 	@echo -e "$(BOLD)$(BLUE)══ Conteneurs GNL ══$(NC)"
 	@$(COMPOSE) ps 2>/dev/null || echo "(Docker non disponible)"
@@ -284,7 +357,7 @@ status:
 	 docker exec gnl_mongodb mongosh \
 	   --eval "db.adminCommand('ping')" --quiet > /dev/null 2>&1 \
 	 && echo -e "$(GREEN)● UP$(NC)" \
-	 || echo -e "$(RED)● DOWN (make up ou make start-codespaces)$(NC)"
+	 || echo -e "$(RED)● DOWN$(NC)"
 	@echo -n "  Mongo-Express : " && \
 	 curl -sf http://localhost:8081 > /dev/null 2>&1 \
 	 && echo -e "$(GREEN)● UP → http://localhost:8081$(NC)" \
@@ -292,6 +365,10 @@ status:
 	@echo -n "  Grafana       : " && \
 	 curl -sf http://localhost:3000/api/health > /dev/null 2>&1 \
 	 && echo -e "$(GREEN)● UP$(NC)" || echo -e "$(RED)● DOWN$(NC)"
+	@echo -n "  MQTT TLS      : " && \
+	 [ -f "$(CERT_DIR)/ca.crt" ] \
+	 && echo -e "$(GREEN)● Certificats OK (port 8883)$(NC)" \
+	 || echo -e "$(YELLOW)● Certificats absents (make setup-certs)$(NC)"
 
 # ── ══════════════════════════════════════════════════════════════════════════ ──
 ##  INSTALLATION
@@ -369,15 +446,13 @@ gemma4-status:
 	@echo -e "$(BOLD)$(BLUE)══ État Gemma4 (localhost:8080) ══$(NC)"
 	@if curl -sf http://localhost:8080/health > /dev/null 2>&1; then \
 	  echo -e "  $(GREEN)● Gemma4 : OPÉRATIONNEL$(NC)"; \
-	  echo -e "  $(BLUE)  Endpoint : http://localhost:8080/completion$(NC)"; \
 	else \
 	  echo -e "  $(RED)● Gemma4 : HORS LIGNE$(NC)"; \
 	  echo -e "  $(YELLOW)  → make start-gemma4$(NC)"; \
-	  echo -e "  $(YELLOW)  → make download-gemma4  (si modèle absent)$(NC)"; \
 	fi
 
 # ── ══════════════════════════════════════════════════════════════════════════ ──
-##  MONGODB — HISTORIQUE DASHBOARD
+##  MONGODB
 # ── ══════════════════════════════════════════════════════════════════════════ ──
 
 ## mongo-status     : État de MongoDB et Mongo-Express
@@ -387,10 +462,8 @@ mongo-status:
 	    --eval "db.adminCommand('ping')" --quiet > /dev/null 2>&1; then \
 	  echo -e "  $(GREEN)● MongoDB       : OPÉRATIONNEL (port 27017)$(NC)"; \
 	  echo -e "  $(GREEN)● Mongo-Express : http://localhost:8081$(NC)"; \
-	  echo -e "  $(BLUE)    Login : nouar / hamel$(NC)"; \
 	else \
 	  echo -e "  $(RED)● MongoDB : HORS LIGNE$(NC)"; \
-	  echo -e "  $(YELLOW)  → make up  ou  make start-codespaces$(NC)"; \
 	fi
 
 ## mongo-logs       : Logs MongoDB (live)
@@ -462,7 +535,7 @@ setup-mqtt:
 	  2>/dev/null || true
 	@docker exec gnl_mosquitto kill -HUP 1 2>/dev/null || true
 
-## mqtt-listen      : Écoute tous les topics gnl/# (broker public HiveMQ)
+## mqtt-listen      : Écoute tous les topics gnl/#
 mqtt-listen:
 	@echo -e "$(BLUE)► Écoute MQTT broker.hivemq.com:1883 — Ctrl+C pour arrêter...$(NC)"
 	@mosquitto_sub -h broker.hivemq.com -p 1883 -t "gnl/#" -v 2>/dev/null || \
@@ -471,7 +544,7 @@ mqtt-listen:
 
 ## mqtt-publish-test : Publie un message de test MQTT
 mqtt-publish-test:
-	@echo -e "$(BLUE)► Publication message test MQTT (public broker)...$(NC)"
+	@echo -e "$(BLUE)► Publication message test MQTT...$(NC)"
 	@mosquitto_pub -h broker.hivemq.com -p 1883 \
 	  -t "gnl/test" -m '{"test":true,"source":"makefile"}' \
 	  && echo -e "$(GREEN)✓ Message publié$(NC)" || \
@@ -487,7 +560,7 @@ setup-influx:
 	  --org gnl_org --bucket gnl_monitoring --retention 30d --force \
 	  2>/dev/null || echo -e "$(YELLOW)  InfluxDB déjà configuré$(NC)"
 
-## influx-query     : Dernières mesures InfluxDB (5 dernières minutes)
+## influx-query     : Dernières mesures InfluxDB
 influx-query:
 	@curl -sf -XPOST "http://localhost:8086/api/v2/query" \
 	  -H "Authorization: Token $(INFLUX_TOKEN)" \
@@ -547,7 +620,7 @@ api-alerts:
 	curl -s http://localhost:5000/api/v1/alerts \
 	  -H "Authorization: Bearer $$TOKEN" | python3 -m json.tool
 
-## api-history      : Résumé historique du jour (MongoDB — teste les endpoints /history)
+## api-history      : Résumé historique du jour
 api-history:
 	@TOKEN=$$(curl -s -X POST http://localhost:5000/api/v1/auth/login \
 	  -H "Content-Type: application/json" \
@@ -617,7 +690,7 @@ format:
 ##  DIAGNOSTIC
 # ── ══════════════════════════════════════════════════════════════════════════ ──
 
-## check-deps       : Vérifie les dépendances (Python, Docker, Gemma4, MongoDB)
+## check-deps       : Vérifie les dépendances
 check-deps:
 	@echo -e "$(BLUE)► Vérification dépendances...$(NC)"
 	@echo -n "  python3   : " && which python3 > /dev/null 2>&1 \
@@ -627,20 +700,22 @@ check-deps:
 	  && echo -e "$(GREEN)✓$(NC)" || echo -e "$(RED)✗$(NC)"
 	@echo -n "  docker    : " && docker info > /dev/null 2>&1 \
 	  && echo -e "$(GREEN)✓$(NC)" || echo -e "$(YELLOW)⚠ non disponible$(NC)"
+	@echo -n "  openssl   : " && which openssl > /dev/null 2>&1 \
+	  && echo -e "$(GREEN)✓ ($(shell openssl version))$(NC)" \
+	  || echo -e "$(RED)✗ — sudo apt install openssl$(NC)"
 	@echo -n "  Gemma4    : " && \
 	  [ -f "$(DOCKER_DIR)/models/gemma4/$(GEMMA4_MODEL_FILE)" ] \
 	  && echo -e "$(GREEN)✓ modèle présent$(NC)" \
 	  || echo -e "$(YELLOW)⚠ absent (make download-gemma4)$(NC)"
-	@echo -n "  MongoDB   : " && \
-	  docker ps --filter "name=gnl_mongodb" --filter "status=running" -q \
-	    2>/dev/null | grep -q . \
-	  && echo -e "$(GREEN)✓ container running$(NC)" \
-	  || echo -e "$(YELLOW)⚠ arrêté (make up ou make start-codespaces)$(NC)"
+	@echo -n "  Certs TLS : " && \
+	  [ -f "$(CERT_DIR)/ca.crt" ] \
+	  && echo -e "$(GREEN)✓ présents ($(CERT_DIR))$(NC)" \
+	  || echo -e "$(YELLOW)⚠ absents → générés automatiquement au prochain make start$(NC)"
 
-## check-ports      : Vérifie les ports requis (5000, 8080, 8086, 3000, 27017, 8081, 1883)
+## check-ports      : Vérifie les ports requis
 check-ports:
 	@echo -e "$(BOLD)$(BLUE)══ Ports en écoute ══$(NC)"
-	@for port in 5000 8080 8086 3000 27017 8081 1883 4040; do \
+	@for port in 5000 8080 8086 3000 27017 8081 1883 8883 4040; do \
 	  echo -n "  Port $$port : "; \
 	  ss -tlnp 2>/dev/null | grep -q ":$$port " \
 	    && echo -e "$(GREEN)● occupé$(NC)" || echo -e "$(YELLOW)○ libre$(NC)"; \
@@ -649,7 +724,7 @@ check-ports:
 ## check-serial     : Ports série Arduino disponibles
 check-serial:
 	@ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null || \
-	  echo -e "$(YELLOW)  Aucun port série (normal en Codespaces — utiliser bridge PC)$(NC)"
+	  echo -e "$(YELLOW)  Aucun port série$(NC)"
 
 ## check-ngrok      : État du tunnel ngrok
 check-ngrok:
@@ -685,29 +760,32 @@ ngrok-open:
 ##  NETTOYAGE
 # ── ══════════════════════════════════════════════════════════════════════════ ──
 
-## clean            : Supprime fichiers temporaires Python (__pycache__, .pyc)
+## clean            : Supprime fichiers temporaires Python
 clean:
 	@find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	@find . -name "*.pyc" -delete 2>/dev/null || true
 	@rm -rf .pytest_cache coverage_html .coverage 2>/dev/null || true
 	@echo -e "$(GREEN)✓ Nettoyage OK$(NC)"
 
-## docker-clean     : Supprime ressources Docker GNL (volumes compris)
+## docker-clean     : Supprime ressources Docker GNL
 docker-clean:
-	@read -p "Confirmer suppression Docker GNL (volumes MongoDB/InfluxDB inclus) [oui/NON] : " c \
+	@read -p "Confirmer suppression Docker GNL (volumes compris) [oui/NON] : " c \
 	  && [ "$$c" = "oui" ] || exit 1
 	@$(COMPOSE) --profile ai down -v --rmi local --remove-orphans
 	@docker volume prune -f 2>/dev/null || true
 
-## fclean           : Nettoyage complet (Python + Docker)
+## fclean           : Nettoyage complet (Python + Docker + Certificats)
 fclean: clean docker-clean
+	@read -p "Supprimer aussi les certificats TLS ? [oui/NON] : " c \
+	  && [ "$$c" = "oui" ] && rm -rf $(CERT_DIR) \
+	  && echo -e "$(GREEN)✓ Certificats supprimés$(NC)" || true
 
 ## docker-ps        : Liste les conteneurs GNL
 docker-ps:
 	@docker ps --filter "name=gnl_" \
 	  --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
-## docker-logs      : Logs récents des 3 conteneurs principaux
+## docker-logs      : Logs récents des conteneurs principaux
 docker-logs:
 	@docker logs --tail=30 gnl_edge_node 2>/dev/null || true
 	@docker logs --tail=20 gnl_gemma4    2>/dev/null || true
@@ -724,7 +802,7 @@ backup:
 	 rm -rf $(PROJECT_DIR)/backups/$$BNAME && \
 	 echo -e "$(GREEN)✓ Sauvegarde : backups/$$BNAME.tar.gz$(NC)"
 
-## restore          : Restaure une sauvegarde (voir backups/)
+## restore          : Restaure une sauvegarde
 restore:
 	@echo -e "$(YELLOW)Usage : tar -xzf backups/<fichier>.tar.gz -C .$(NC)"
 	@ls -lh $(PROJECT_DIR)/backups/*.tar.gz 2>/dev/null || \
@@ -738,21 +816,12 @@ restore:
 	@echo -e "$(YELLOW)► Fichier .env non trouvé — création avec valeurs par défaut...$(NC)"
 	@printf '%s\n' \
 	  '# GNL IoT Edge — Configuration' \
-	  '# ⚠ Renseigner NGROK_AUTHTOKEN et HF_TOKEN avant de lancer' \
-	  '' \
-	  '# HuggingFace (téléchargement Gemma4)' \
 	  'HF_TOKEN=hf_CHANGE_ME' \
-	  '' \
-	  '# ngrok (optionnel — accès externe)' \
 	  'NGROK_AUTHTOKEN=CHANGE_ME' \
 	  'NGROK_DOMAIN=theology-custody-rocky.ngrok-free.dev' \
 	  'NGROK_URL=https://theology-custody-rocky.ngrok-free.dev' \
-	  '' \
-	  '# Arduino' \
 	  'SERIAL_PORT=/dev/ttyUSB0' \
 	  'SERIAL_BAUD=9600' \
-	  '' \
-	  '# Gemma4 — IA locale (llama.cpp)' \
 	  'GEMMA4_VARIANT=e2b' \
 	  'GEMMA4_QUANT=Q4_K_M' \
 	  'GEMMA4_DEST=docker/models/gemma4' \
@@ -765,22 +834,16 @@ restore:
 	  'GEMMA4_GPU_LAYERS=0' \
 	  'GEMMA4_TIMEOUT=60' \
 	  'GEMMA4_TEMPERATURE=0.15' \
-	  '' \
-	  '# IA' \
 	  'GNL_AI_PROVIDER=gemma4' \
 	  'GNL_AI_INTERVAL=30' \
 	  'GNL_AI_RISK_TRIGGER=60' \
 	  'GNL_AI_MAX_TOKENS=512' \
-	  '' \
-	  '# Watchdog' \
 	  'WATCHDOG_TIMEOUT_S=300' \
 	  'WATCHDOG_MAX_ERRORS=10' \
 	  'WATCHDOG_TICK_S=2.0' \
 	  'WATCHDOG_OS_SHUTDOWN=false' \
 	  'WATCHDOG_SENSORS_DEAD_MAX=5' \
 	  'ESD_ACK_TIMEOUT_S=10' \
-	  '' \
-	  '# InfluxDB' \
 	  'INFLUX_URL=http://localhost:8086' \
 	  'INFLUX_TOKEN=hamel' \
 	  'INFLUX_ORG=gnl_org' \
@@ -792,8 +855,6 @@ restore:
 	  'DOCKER_INFLUXDB_INIT_BUCKET=gnl_monitoring' \
 	  'DOCKER_INFLUXDB_INIT_RETENTION=30d' \
 	  'DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=hamel' \
-	  '' \
-	  '# MQTT' \
 	  'MQTT_HOST=broker.hivemq.com' \
 	  'MQTT_PORT=1883' \
 	  'MQTT_USER_PUBLISHER=nouar' \
@@ -802,37 +863,26 @@ restore:
 	  'MQTT_PASS_DASHBOARD=hamel' \
 	  'MQTT_USER_ADMIN=nouar' \
 	  'MQTT_PASS_ADMIN=hamel' \
-	  '' \
-	  '# Grafana' \
 	  'GF_SECURITY_ADMIN_USER=nouar' \
 	  'GF_SECURITY_ADMIN_PASSWORD=hamel' \
 	  'GF_USERS_ALLOW_SIGN_UP=false' \
-	  '' \
-	  '# API REST' \
 	  'GNL_JWT_SECRET=hamel' \
 	  'API_HOST=0.0.0.0' \
 	  'API_PORT=5000' \
-	  '' \
-	  '# Seuils' \
 	  'GAS_WARN=250' \
 	  'GAS_DANGER=450' \
 	  'LEVEL_HIGH=95' \
 	  'LEVEL_LOW=10' \
 	  'CONFIRM_GAS=3' \
-	  '' \
-	  '# MongoDB — Historique dashboard (TTL 30 jours)' \
 	  'MONGO_USER=nouar' \
 	  'MONGO_PASS=hamel' \
 	  'MONGO_DB=gnl_history' \
 	  'MONGO_TTL_DAYS=30' \
-	  '# localhost:27017 pour mode Codespaces/local ; mongodb:27017 pour Docker interne' \
 	  'MONGO_URI=mongodb://nouar:hamel@localhost:27017/' \
 	  'MONGO_EXPRESS_USER=nouar' \
 	  'MONGO_EXPRESS_PASS=hamel' \
 	  > .env
 	@echo -e "$(GREEN)✓ .env créé$(NC)"
-	@echo -e "$(YELLOW)  → Renseigner HF_TOKEN pour download-gemma4$(NC)"
-	@echo -e "$(YELLOW)  → Renseigner NGROK_AUTHTOKEN pour accès externe$(NC)"
 
 # ── ══════════════════════════════════════════════════════════════════════════ ──
 ##  AIDE
@@ -850,18 +900,18 @@ help:
 	    /^[A-Z]/ {printf "  $(BOLD)$(YELLOW)%-24s$(NC) %s\n", $$1, $$2; next} \
 	    {printf "  $(CYAN)%-24s$(NC) %s\n", $$1, $$2}'
 	@echo ""
-	@echo -e "$(BOLD)Flux de données (Codespaces) :$(NC)"
-	@echo -e "  Arduino (PC USB) → arduino_serial_bridge.py → HiveMQ MQTT → Codespaces → Gemma4"
-	@echo ""
 	@echo -e "$(BOLD)Commandes essentielles :$(NC)"
-	@echo -e "  $(GREEN)make start$(NC)               → Lance tout (détecte Codespaces/local automatiquement)"
+	@echo -e "  $(GREEN)make start$(NC)               → Lance tout (certs TLS générés automatiquement)"
+	@echo -e "  $(GREEN)make setup-certs$(NC)         → Génère les certificats TLS (CA locale)"
+	@echo -e "  $(GREEN)make check-certs$(NC)         → Vérifie les certificats"
 	@echo -e "  $(GREEN)make download-gemma4$(NC)     → Télécharge Gemma4 (~3.5 GB)"
-	@echo -e "  $(GREEN)make gemma4-status$(NC)       → Vérifie Gemma4"
-	@echo -e "  $(GREEN)make mongo-status$(NC)        → Vérifie MongoDB + URL Mongo-Express"
-	@echo -e "  $(GREEN)make mongo-express-open$(NC)  → Ouvre l'UI MongoDB (port 8081)"
-	@echo -e "  $(GREEN)make api-history$(NC)         → Teste les endpoints /history (MongoDB)"
 	@echo -e "  $(GREEN)make status$(NC)              → État de tous les services"
 	@echo -e "  $(GREEN)make stop$(NC)                → Arrête tous les services"
+	@echo ""
+	@echo -e "$(BOLD)Sécurité TLS :$(NC)"
+	@echo -e "  Certificats → $(CERT_DIR)/"
+	@echo -e "  MQTT TLS    → port 8883 (externe)"
+	@echo -e "  MQTT plain  → port 1883 (Docker interne uniquement)"
 	@echo ""
 
 all: start
