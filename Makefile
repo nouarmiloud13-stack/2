@@ -438,18 +438,17 @@ ngrok-config:
 ngrok-start:
 	@echo -e "$(BLUE)► Lancement tunnel ngrok → $(NGROK_DOMAIN)...$(NC)"
 	@which ngrok > /dev/null 2>&1 || (echo -e "$(RED)✗ ngrok absent$(NC)" && exit 1)
-	@nohup ngrok http \
-	  --domain="$(NGROK_DOMAIN)" \
-	  --authtoken="$(NGROK_AUTHTOKEN)" \
-	  5000 > /tmp/ngrok.log 2>&1 & \
-	sleep 3; \
-	curl -sf http://localhost:4040/api/tunnels > /dev/null 2>&1 \
+	@pkill -x ngrok 2>/dev/null || true
+	@sleep 1
+	@bash -c 'nohup ngrok http --url="$(NGROK_DOMAIN)" 5000 >/tmp/ngrok.log 2>&1 & disown; exit 0'
+	@sleep 4
+	@curl -sf http://localhost:4040/api/tunnels > /dev/null 2>&1 \
 	  && echo -e "$(GREEN)  ✓ Tunnel ngrok actif — https://$(NGROK_DOMAIN)$(NC)" \
 	  || (echo -e "$(RED)  ✗ Tunnel non démarré$(NC)" && tail -10 /tmp/ngrok.log)
 
 ## ngrok-stop       : Arrête ngrok
 ngrok-stop:
-	@pkill -f "ngrok http" 2>/dev/null \
+	@pkill -x ngrok 2>/dev/null \
 	  && echo -e "$(GREEN)✓ ngrok arrêté$(NC)" || true
 
 # ── ══════════════════════════════════════════════════════════════════════════ ──
